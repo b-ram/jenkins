@@ -6,14 +6,18 @@ import hudson.model.ParametersDefinitionProperty;
 import hudson.model.Result;
 import hudson.model.StringParameterDefinition;
 import hudson.tasks.Maven.MavenInstallation;
+import hudson.tasks.test.AbstractTestResultAction;
+import hudson.tasks.test.AggregatedTestResultAction;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Map;
 
 import org.jvnet.hudson.test.Bug;
 import org.jvnet.hudson.test.Email;
 import org.jvnet.hudson.test.ExtractResourceSCM;
 import org.jvnet.hudson.test.HudsonTestCase;
+import org.jvnet.hudson.test.SingleFileSCM;
 
 /**
  * @author Kohsuke Kawaguchi
@@ -145,7 +149,47 @@ public class MavenBuildTest extends HudsonTestCase {
         assertFalse( content.contains( "${maven.build.timestamp}") );
 
         System.out.println( "content " + content );
-    }    
+    }
+    
+    @Bug(value=15865)
+    public void testMavenFailsafePluginTestResultsAreRecorded() throws Exception {
+        
+        // GIVEN: a Maven project with maven-failsafe-plugin and Maven 2.2.1
+        MavenModuleSet mavenProject = createMavenProject();
+        MavenInstallation mavenInstallation = configureDefaultMaven();
+        mavenProject.setMaven(mavenInstallation.getName());
+        mavenProject.getReporters().add(new TestReporter());
+        mavenProject.setScm(new ExtractResourceSCM(getClass().getResource("JENKINS-15865.zip")));
+        mavenProject.setGoals( "clean install" );
+        
+        // WHEN project is build
+        MavenModuleSetBuild mmsb =  buildAndAssertSuccess(mavenProject);
+        
+        // THEN we have a testresult recorded
+        AggregatedTestResultAction aggregatedTestResultAction = mmsb.getAggregatedTestResultAction();
+        assertNotNull(aggregatedTestResultAction);
+        assertEquals(1, aggregatedTestResultAction.getTotalCount());
+        
+        Map<MavenModule, MavenBuild> moduleBuilds = mmsb.getModuleLastBuilds();
+        assertEquals(1, moduleBuilds.size());
+        MavenBuild moduleBuild = moduleBuilds.values().iterator().next();
+         AbstractTestResultAction<?> testResultAction = moduleBuild.getTestResultAction();
+        assertNotNull(testResultAction);
+        assertEquals(1, testResultAction.getTotalCount());
+    }
+
+    @Bug(18178)
+    public void testExtensionsConflictingWithCore() throws Exception {
+        MavenModuleSet m = createMavenProject();
+        m.setMaven(configureDefaultMaven().getName());
+        m.setScm(new SingleFileSCM("pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion>" +
+                "<groupId>g</groupId><artifactId>a</artifactId><version>0</version>" +
+                "<build><extensions>" +
+                "<extension><groupId>org.springframework.build.aws</groupId><artifactId>org.springframework.build.aws.maven</artifactId><version>3.0.0.RELEASE</version></extension>" +
+                "</extensions></build></project>"));
+        buildAndAssertSuccess(m);
+    }
     
     private static class TestReporter extends MavenReporter {
         private static final long serialVersionUID = 1L;

@@ -23,6 +23,7 @@
  */
 package hudson;
 
+import static org.mockito.Mockito.*;
 import hudson.FilePath.TarCompression;
 import hudson.model.TaskListener;
 import hudson.remoting.LocalChannel;
@@ -30,10 +31,17 @@ import hudson.remoting.VirtualChannel;
 import hudson.util.IOException2;
 import hudson.util.NullStream;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.URLStreamHandler;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -43,6 +51,8 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.output.NullOutputStream;
@@ -191,6 +201,46 @@ public class FilePathTest extends ChannelTestCase {
             assertEquals(1, fp.copyRecursiveTo(new FilePath(dst)));
             // copy again should still report 1
             assertEquals(1, fp.copyRecursiveTo(new FilePath(dst)));
+        } finally {
+            Util.deleteRecursive(tmp);
+        }
+    }
+
+    @Bug(9540)
+    public void testErrorMessageInRemoteCopyRecursive() throws Exception {
+        File tmp = Util.createTempDir();
+        try {
+            File src = new File(tmp, "src");
+            File dst = new File(tmp, "dst");
+            FilePath from = new FilePath(src);
+            FilePath to = new FilePath(british, dst.getAbsolutePath());
+            for (int i = 0; i < 10000; i++) {
+                // TODO is there a simpler way to force the TarOutputStream to be flushed and the reader to start?
+                // Have not found a way to make the failure guaranteed.
+                OutputStream os = from.child("content" + i).write();
+                try {
+                    for (int j = 0; j < 1024; j++) {
+                        os.write('.');
+                    }
+                } finally {
+                    os.close();
+                }
+            }
+            FilePath toF = to.child("content0");
+            toF.write().close();
+            toF.chmod(0400);
+            try {
+                from.copyRecursiveTo(to);
+                // on Windows this may just succeed; OK, test did not prove anything then
+            } catch (IOException x) {
+                if (Functions.printThrowable(x).contains("content0")) {
+                    // Fine, error message talks about permission denied.
+                } else {
+                    throw x;
+                }
+            } finally {
+                toF.chmod(700);
+            }
         } finally {
             Util.deleteRecursive(tmp);
         }
@@ -439,7 +489,7 @@ public class FilePathTest extends ChannelTestCase {
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_portionMatchButPreviousNotMatchAndSuggest("**/*.js", "**", "**/*.js"), d, "**/*.js");
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_doesntMatchAnything("index.htm"), d, "index.htm");
             assertValidateAntFileMask(Messages.FilePath_validateAntFileMask_doesntMatchAndSuggest("f.html", "d1/d2/d3/f.html"), d, "f.html");
-            // XXX lots more to test, e.g. multiple patterns separated by commas; ought to have full code coverage for this method
+            // TODO lots more to test, e.g. multiple patterns separated by commas; ought to have full code coverage for this method
         } finally {
             Util.deleteRecursive(tmp);
         }
@@ -501,5 +551,70 @@ public class FilePathTest extends ChannelTestCase {
         } finally {
             Util.deleteRecursive(tmp);
         }
+    }
+
+    @Bug(16215)
+    public void testInstallIfNecessaryAvoidsExcessiveDownloadsByUsingIfModifiedSince() throws Exception {
+        final File tmp = Util.createTempDir();
+        try {
+            final FilePath d = new FilePath(tmp);
+
+            d.child(".timestamp").touch(123000);
+
+            final HttpURLConnection con = mock(HttpURLConnection.class);
+            final URL url = someUrlToZipFile(con);
+
+            when(con.getResponseCode())
+                .thenReturn(HttpURLConnection.HTTP_NOT_MODIFIED);
+
+            assertFalse(d.installIfNecessaryFrom(url, null, null));
+
+            verify(con).setIfModifiedSince(123000);
+        } finally {
+            Util.deleteRecursive(tmp);
+        }
+    }
+
+    @Bug(16215)
+    public void testInstallIfNecessaryPerformsInstallation() throws Exception {
+        final File tmp = Util.createTempDir();
+        try {
+            final FilePath d = new FilePath(tmp);
+
+            final HttpURLConnection con = mock(HttpURLConnection.class);
+            final URL url = someUrlToZipFile(con);
+
+            when(con.getResponseCode())
+              .thenReturn(HttpURLConnection.HTTP_OK);
+
+            when(con.getInputStream())
+              .thenReturn(someZippedContent());
+
+            assertTrue(d.installIfNecessaryFrom(url, null, null));
+        } finally {
+          Util.deleteRecursive(tmp);
+        }
+    }
+
+    private URL someUrlToZipFile(final URLConnection con) throws IOException {
+
+        final URLStreamHandler urlHandler = new URLStreamHandler() {
+            @Override protected URLConnection openConnection(URL u) throws IOException {
+                return con;
+            }
+        };
+
+        return new URL("http", "some-host", 0, "/some-path.zip", urlHandler);
+    }
+
+    private InputStream someZippedContent() throws IOException {
+        final ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        final ZipOutputStream zip = new ZipOutputStream(buf);
+
+        zip.putNextEntry(new ZipEntry("abc"));
+        zip.write("abc".getBytes());
+        zip.close();
+
+        return new ByteArrayInputStream(buf.toByteArray());
     }
 }

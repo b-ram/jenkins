@@ -24,10 +24,19 @@
 
 package hudson.model;
 
+import hudson.Util;
+import hudson.model.Run.Artifact;
+import hudson.util.StreamTaskListener;
+
+import java.io.File;
+import java.util.Date;
+import java.util.List;
 import java.util.TimeZone;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+
 import static org.junit.Assert.*;
 import org.junit.Test;
 import org.jvnet.hudson.test.Bug;
@@ -75,6 +84,66 @@ public class RunTest {
         } finally {
             TimeZone.setDefault(origTZ);
         }
+    }
+    
+
+    @Bug(15587)
+    @Test 
+    public void testParseTimestampFromBuildDir() throws Exception {
+        //Assume.assumeTrue(!Functions.isWindows() || (NTFS && JAVA7) || ...);
+        
+        String buildDateTime = "2012-12-21_04-02-28";
+        int buildNumber = 155;
+        
+        StreamTaskListener l = StreamTaskListener.fromStdout();
+
+        File tempDir = Util.createTempDir();    
+        File buildDir = new File(tempDir, buildDateTime);
+        assertEquals(true, buildDir.mkdir());
+        File buildDirSymLink = new File(tempDir, Integer.toString(buildNumber));
+        
+        try {
+        	buildDir.mkdir();
+         
+            Util.createSymlink(tempDir, buildDir.getAbsolutePath(), buildDirSymLink.getName(), l);
+            long time = Run.parseTimestampFromBuildDir(buildDirSymLink);
+            assertEquals(buildDateTime, Run.ID_FORMATTER.get().format(new Date(time)));
+        } finally {
+            Util.deleteRecursive(tempDir);
+        }
+    }
+
+    private List<? extends Run<?, ?>.Artifact> createArtifactList(String... paths) throws Exception {
+        Run r = new Run(new StubJob(), 0) {};
+        Run.ArtifactList list = r.new ArtifactList();
+        for (String p : paths) {
+            list.add(r.new Artifact(p, p, p, String.valueOf(p.length()), "n" + list.size()));  // Assuming all test inputs don't need urlencoding
+        }
+        list.computeDisplayName();
+        return list;
+    }
+
+    @Test
+    public void artifactListDisambiguation1() throws Exception {
+        List<? extends Run<?, ?>.Artifact> a = createArtifactList("a/b/c.xml", "d/f/g.xml", "h/i/j.xml");
+        assertEquals(a.get(0).getDisplayPath(), "c.xml");
+        assertEquals(a.get(1).getDisplayPath(), "g.xml");
+        assertEquals(a.get(2).getDisplayPath(), "j.xml");
+    }
+
+    @Test
+    public void artifactListDisambiguation2() throws Exception {
+        List<? extends Run<?, ?>.Artifact> a = createArtifactList("a/b/c.xml", "d/f/g.xml", "h/i/g.xml");
+        assertEquals(a.get(0).getDisplayPath(), "c.xml");
+        assertEquals(a.get(1).getDisplayPath(), "f/g.xml");
+        assertEquals(a.get(2).getDisplayPath(), "i/g.xml");
+    }
+
+    @Test
+    public void artifactListDisambiguation3() throws Exception {
+        List<? extends Run<?, ?>.Artifact> a = createArtifactList("a.xml", "a/a.xml");
+        assertEquals(a.get(0).getDisplayPath(), "a.xml");
+        assertEquals(a.get(1).getDisplayPath(), "a/a.xml");
     }
 
 }

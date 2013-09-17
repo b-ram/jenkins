@@ -28,7 +28,7 @@ import com.thoughtworks.xstream.converters.Converter;
 import com.thoughtworks.xstream.converters.MarshallingContext;
 import com.thoughtworks.xstream.converters.SingleValueConverter;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
-import com.thoughtworks.xstream.converters.reflection.NonExistentFieldException;
+import com.thoughtworks.xstream.converters.reflection.MissingFieldException;
 import com.thoughtworks.xstream.converters.reflection.ObjectAccessException;
 import com.thoughtworks.xstream.converters.reflection.PureJavaReflectionProvider;
 import com.thoughtworks.xstream.converters.reflection.ReflectionConverter;
@@ -51,8 +51,9 @@ import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.Map;
 import java.util.Set;
-import static java.util.logging.Level.WARNING;
+import static java.util.logging.Level.FINE;
 import java.util.logging.Logger;
+import javax.annotation.Nonnull;
 
 /**
  * Custom {@link ReflectionConverter} that handle errors more gracefully.
@@ -71,10 +72,10 @@ public class RobustReflectionConverter implements Converter {
     protected final Mapper mapper;
     protected transient SerializationMethodInvoker serializationMethodInvoker;
     private transient ReflectionProvider pureJavaReflectionProvider;
-    private final XStream2.ClassOwnership classOwnership;
+    private final @Nonnull XStream2.ClassOwnership classOwnership;
 
     public RobustReflectionConverter(Mapper mapper, ReflectionProvider reflectionProvider) {
-        this(mapper, reflectionProvider, null);
+        this(mapper, reflectionProvider, new XStream2().new PluginClassOwnership());
     }
     RobustReflectionConverter(Mapper mapper, ReflectionProvider reflectionProvider, XStream2.ClassOwnership classOwnership) {
         this.mapper = mapper;
@@ -96,7 +97,7 @@ public class RobustReflectionConverter implements Converter {
         }
 
         OwnerContext oc = OwnerContext.find(context);
-        oc.startVisiting(writer, classOwnership == null ? null : classOwnership.ownerOf(original.getClass()));
+        oc.startVisiting(writer, classOwnership.ownerOf(original.getClass()));
         try {
             doMarshal(source, writer, context);
         } finally {
@@ -292,14 +293,14 @@ public class RobustReflectionConverter implements Converter {
                         implicitCollectionsForCurrentObject = writeValueToImplicitCollection(context, value, implicitCollectionsForCurrentObject, result, fieldName);
                     }
                 }
-            } catch (NonExistentFieldException e) {
-                LOGGER.log(WARNING,"Skipping a non-existent field "+e.getFieldName(),e);
+            } catch (MissingFieldException e) {
+                LOGGER.log(FINE, "Skipping a non-existent field " + e.getFieldName(), e);
                 addErrorInContext(context, e);
             } catch (CannotResolveClassException e) {
-                LOGGER.log(WARNING,"Skipping a non-existent type",e);
+                LOGGER.log(FINE, "Skipping a non-existent type", e);
                 addErrorInContext(context, e);
             } catch (LinkageError e) {
-                LOGGER.log(WARNING,"Failed to resolve a type",e);
+                LOGGER.log(FINE, "Failed to resolve a type", e);
                 addErrorInContext(context, e);
             }
 

@@ -4,6 +4,7 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.XmlFile;
 import hudson.util.FormValidation;
+import hudson.util.XStream2;
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
@@ -19,6 +20,7 @@ import java.util.logging.Logger;
  * Stores the location of Jenkins (e-mail address and the HTTP URL.)
  *
  * @author Kohsuke Kawaguchi
+ * @since 1.494
  */
 @Extension
 public class JenkinsLocationConfiguration extends GlobalConfiguration {
@@ -29,8 +31,15 @@ public class JenkinsLocationConfiguration extends GlobalConfiguration {
     private String adminAddress;
     private String jenkinsUrl;
 
+    // just to suppress warnings
+    private transient String charset,useSsl;
+
     public static JenkinsLocationConfiguration get() {
         return GlobalConfiguration.all().get(JenkinsLocationConfiguration.class);
+    }
+
+    public JenkinsLocationConfiguration() {
+        load();
     }
 
     @Override
@@ -39,7 +48,9 @@ public class JenkinsLocationConfiguration extends GlobalConfiguration {
         // load from Mailer.
         XmlFile file = getConfigFile();
         if(!file.exists()) {
-            file = new XmlFile(new File(Jenkins.getInstance().getRootDir(),"hudson.tasks.Mailer.xml"));
+            XStream2 xs = new XStream2();
+            xs.addCompatibilityAlias("hudson.tasks.Mailer$DescriptorImpl",JenkinsLocationConfiguration.class);
+            file = new XmlFile(xs,new File(Jenkins.getInstance().getRootDir(),"hudson.tasks.Mailer.xml"));
             if (file.exists()) {
                 try {
                     file.unmarshal(this);

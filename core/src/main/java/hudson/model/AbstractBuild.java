@@ -88,6 +88,9 @@ import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import static java.util.logging.Level.WARNING;
 
 /**
  * Base implementation of {@link Run}s that build software.
@@ -148,7 +151,7 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
     private volatile Set<String> culprits;
 
     /**
-     * During the build this field remembers {@link BuildWrapper.Environment}s created by
+     * During the build this field remembers {@link hudson.tasks.BuildWrapper.Environment}s created by
      * {@link BuildWrapper}. This design is bit ugly but forced due to compatibility.
      */
     protected transient List<Environment> buildEnvironments;
@@ -189,7 +192,13 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
 
         if(nextBuild!=null) {
             AbstractBuild nb = nextBuild.get();
-            if (nb!=null)   nb.previousBuild = previousBuild;
+            if (nb!=null) {
+                // remove the oldest build
+                if (previousBuild == selfReference) 
+                    nb.previousBuild = nextBuild;
+                else 
+                    nb.previousBuild = previousBuild;
+            }
         }
         if(previousBuild!=null) {
             AbstractBuild pb = previousBuild.get();
@@ -204,7 +213,11 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
 
             if (r==null) {
                 // having two neighbors pointing to each other is important to make RunMap.removeValue work
-                R pb = getParent().builds.search(number-1, Direction.DESC);
+                P _parent = getParent();
+                if (_parent == null) {
+                    throw new IllegalStateException("no parent for " + number + " in " + workspace);
+                }
+                R pb = _parent._getRuns().search(number-1, Direction.DESC);
                 if (pb!=null) {
                     ((AbstractBuild)pb).nextBuild = selfReference;   // establish bi-di link
                     this.previousBuild = pb.selfReference;
@@ -345,7 +358,7 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
     }
 
     /**
-     * Normally, a workspace is assigned by {@link RunExecution}, but this lets you set the workspace in case
+     * Normally, a workspace is assigned by {@link hudson.model.Run.RunExecution}, but this lets you set the workspace in case
      * {@link AbstractBuild} is created without a build.
      */
     protected void setWorkspace(FilePath ws) {
@@ -361,7 +374,7 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
     public final FilePath getModuleRoot() {
         FilePath ws = getWorkspace();
         if (ws==null)    return null;
-        return getParent().getScm().getModuleRoot(ws,this);
+        return getParent().getScm().getModuleRoot(ws, this);
     }
 
     /**
@@ -462,41 +475,9 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
         return hudsonVersion;
     }
 
-    @Override
-    public synchronized void delete() throws IOException {
-        // Need to check if deleting this build affects lastSuccessful/lastStable symlinks
-        R lastSuccessful = getProject().getLastSuccessfulBuild(),
-          lastStable = getProject().getLastStableBuild();
-
-        super.delete();
-
-        try {
-            if (lastSuccessful == this)
-                updateSymlink("lastSuccessful", getProject().getLastSuccessfulBuild());
-            if (lastStable == this)
-                updateSymlink("lastStable", getProject().getLastStableBuild());
-        } catch (InterruptedException ex) {
-            LOGGER.warning("Interrupted update of lastSuccessful/lastStable symlinks for "
-                           + getProject().getDisplayName());
-            // handle it later
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    private void updateSymlink(String name, AbstractBuild<?,?> newTarget) throws InterruptedException {
-        if (newTarget != null)
-            newTarget.createSymlink(new LogTaskListener(LOGGER, Level.WARNING), name);
-        else
-            new File(getProject().getBuildDir(), "../"+name).delete();
-    }
-
-    private void createSymlink(TaskListener listener, String name) throws InterruptedException {
-        Util.createSymlink(getProject().getBuildDir(),"builds/"+getId(),"../"+name,listener);
-    }
-
     /**
      * @deprecated as of 1.467
-     *      Please use {@link RunExecution}
+     *      Please use {@link hudson.model.Run.RunExecution}
      */
     public abstract class AbstractRunner extends AbstractBuildExecution {
 
@@ -724,12 +705,6 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
         public final void post(BuildListener listener) throws Exception {
             try {
                 post2(listener);
-
-                if (result.isBetterOrEqualTo(Result.UNSTABLE))
-                    createSymlink(listener, "lastSuccessful");
-
-                if (result.isBetterOrEqualTo(Result.SUCCESS))
-                    createSymlink(listener, "lastStable");
             } finally {
                 // update the culprit list
                 HashSet<String> r = new HashSet<String>();
@@ -783,7 +758,7 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
                     } catch (Exception e) {
                         String msg = "Publisher " + bs.getClass().getName() + " aborted due to exception";
                         e.printStackTrace(listener.error(msg));
-                        LOGGER.log(Level.WARNING, msg, e);
+                        LOGGER.log(WARNING, msg, e);
                         setResult(Result.FAILURE);
                     }
             }
@@ -801,7 +776,13 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
                 mon = BuildStepMonitor.BUILD;
             }
             Result oldResult = AbstractBuild.this.getResult();
+            for (BuildStepListener bsl : BuildStepListener.all()) {
+                bsl.started(AbstractBuild.this, bs, listener);
+            }
             boolean canContinue = mon.perform(bs, AbstractBuild.this, launcher, listener);
+            for (BuildStepListener bsl : BuildStepListener.all()) {
+                bsl.finished(AbstractBuild.this, bs, listener, canContinue);
+            }
             Result newResult = AbstractBuild.this.getResult();
             if (newResult != oldResult) {
                 String buildStepName = getBuildStepName(bs);
@@ -918,9 +899,9 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
         try {
             return scm.parse(this,changelogFile);
         } catch (IOException e) {
-            e.printStackTrace();
+            LOGGER.log(WARNING, "Failed to parse "+changelogFile,e);
         } catch (SAXException e) {
-            e.printStackTrace();
+            LOGGER.log(WARNING, "Failed to parse "+changelogFile,e);
         }
         return ChangeLogSet.createEmpty(this);
     }
@@ -1345,7 +1326,10 @@ public abstract class AbstractBuild<P extends AbstractProject<P,R>,R extends Abs
      *
      * If we use this/executor/stop URL, it causes 404 if the build is already killed,
      * as {@link #getExecutor()} returns null.
+     * 
+     * @since 1.489
      */
+    @RequirePOST
     public synchronized HttpResponse doStop() throws IOException, ServletException {
         Executor e = getExecutor();
         if (e==null)

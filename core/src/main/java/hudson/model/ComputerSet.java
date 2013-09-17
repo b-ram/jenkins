@@ -33,8 +33,12 @@ import hudson.model.listeners.SaveableListener;
 import hudson.node_monitors.NodeMonitor;
 import hudson.slaves.NodeDescriptor;
 import hudson.util.DescribableList;
+import hudson.util.FormApply;
 import hudson.util.FormValidation;
 import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import jenkins.model.ModelObjectWithContextMenu.ContextMenu;
+import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
 import org.kohsuke.stapler.StaplerResponse;
@@ -63,7 +67,7 @@ import net.sf.json.JSONObject;
  * @author Kohsuke Kawaguchi
  */
 @ExportedBean
-public final class ComputerSet extends AbstractModelObject implements Describable<ComputerSet> {
+public final class ComputerSet extends AbstractModelObject implements Describable<ComputerSet>, ModelObjectWithChildren {
     /**
      * This is the owner that persists {@link #monitors}.
      */
@@ -93,6 +97,14 @@ public final class ComputerSet extends AbstractModelObject implements Describabl
     @Exported(name="computer",inline=true)
     public Computer[] get_all() {
         return Jenkins.getInstance().getComputers();
+    }
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        ContextMenu m = new ContextMenu();
+        for (Computer c : get_all()) {
+            m.add(c);
+        }
+        return m;
     }
 
     /**
@@ -202,7 +214,10 @@ public final class ComputerSet extends AbstractModelObject implements Describabl
         
         for (NodeMonitor nodeMonitor : NodeMonitor.getAll()) {
             Thread t = nodeMonitor.triggerUpdate();
-            t.setName(nodeMonitor.getColumnCaption());
+            String columnCaption = nodeMonitor.getColumnCaption();
+            if (columnCaption != null) {
+                t.setName(columnCaption);
+            }
         }
         rsp.forwardToPreviousPage(req);
     }
@@ -315,7 +330,7 @@ public final class ComputerSet extends AbstractModelObject implements Describabl
      * Accepts submission from the configuration page.
      */
     @RequirePOST
-    public synchronized void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+    public synchronized HttpResponse doConfigSubmit( StaplerRequest req) throws IOException, ServletException, FormException {
         BulkChange bc = new BulkChange(MONITORS_OWNER);
         try {
             Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);
@@ -334,7 +349,7 @@ public final class ComputerSet extends AbstractModelObject implements Describabl
                 nm.triggerUpdate();
             }
 
-            rsp.sendRedirect2(".");
+            return FormApply.success(".");
         } finally {
             bc.commit();
         }
@@ -414,8 +429,8 @@ public final class ComputerSet extends AbstractModelObject implements Describabl
                         r.add(i);
                 }
             monitors.replaceBy(r.toList());
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to instanciate NodeMonitors",e);
+        } catch (Throwable x) {
+            LOGGER.log(Level.WARNING, "Failed to instantiate NodeMonitors", x);
         }
     }
 

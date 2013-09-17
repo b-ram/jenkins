@@ -39,8 +39,10 @@ import hudson.lifecycle.RestartNotSupportedException;
 import hudson.model.UpdateSite.Data;
 import hudson.model.UpdateSite.Plugin;
 import hudson.model.listeners.SaveableListener;
+import hudson.remoting.AtmostOneThreadExecutor;
 import hudson.security.ACL;
 import hudson.util.DaemonThreadFactory;
+import hudson.util.FormValidation;
 import hudson.util.HttpResponses;
 import hudson.util.IOException2;
 import hudson.util.PersistedList;
@@ -76,6 +78,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.Vector;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -87,6 +90,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
 import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 import org.kohsuke.stapler.interceptor.RequirePOST;
@@ -117,11 +122,15 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
      * @since 1.483
      */
     public static final String ID_DEFAULT = "default";
+
+    @Restricted(NoExternalUse.class)
+    public static final String ID_UPLOAD = "_upload";
 	
     /**
      * {@link ExecutorService} that performs installation.
+     * @since 1.501
      */
-    private final ExecutorService installerService = Executors.newSingleThreadExecutor(
+    private final ExecutorService installerService = new AtmostOneThreadExecutor(
         new DaemonThreadFactory(new ThreadFactory() {
             public Thread newThread(Runnable r) {
                 Thread t = new Thread(r);
@@ -130,6 +139,18 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
             }
         }));
 
+    /**
+     * An {@link ExecutorService} for updating UpdateSites.
+     */
+    protected final ExecutorService updateService = Executors.newCachedThreadPool(
+        new DaemonThreadFactory(new ThreadFactory() {
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r);
+                t.setName("Update site data downloader");
+                return t;
+            }
+        }));
+        
     /**
      * List of created {@link UpdateCenterJob}s. Access needs to be synchronized.
      */
@@ -263,13 +284,15 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
      * Will be the newest of all {@link UpdateSite}s.
      */
     public String getLastUpdatedString() {
-        long newestTs = -1;
+        long newestTs = 0;
         for (UpdateSite s : sites) {
             if (s.getDataTimestamp()>newestTs) {
                 newestTs = s.getDataTimestamp();
             }
         }
-        if(newestTs<0)     return "N/A";
+        if (newestTs == 0) {
+            return Messages.UpdateCenter_n_a();
+        }
         return Util.getPastTimeString(System.currentTimeMillis()-newestTs);
     }
 
@@ -462,10 +485,14 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
     public String getBackupVersion() {
         try {
             JarFile backupWar = new JarFile(new File(Lifecycle.get().getHudsonWar() + ".bak"));
-            Attributes attrs = backupWar.getManifest().getMainAttributes();
-            String v = attrs.getValue("Jenkins-Version");
-            if (v==null)    v = attrs.getValue("Hudson-Version");
-            return v;
+            try {
+                Attributes attrs = backupWar.getManifest().getMainAttributes();
+                String v = attrs.getValue("Jenkins-Version");
+                if (v==null)    v = attrs.getValue("Hudson-Version");
+                return v;
+            } finally {
+                backupWar.close();
+            }
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to read backup version ", e);
             return null;}
@@ -601,6 +628,32 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
         }
 
         return new ArrayList<Plugin>(pluginMap.values());
+    }
+    
+    /**
+     * Ensure that all UpdateSites are up to date, without requiring a user to
+     * browse to the instance.
+     * 
+     * @return a list of {@link FormValidation} for each updated Update Site
+     * @throws ExecutionException 
+     * @throws InterruptedException 
+     * @since 1.501
+     * 
+     */
+    public List<FormValidation> updateAllSites() throws InterruptedException, ExecutionException {
+        List <Future<FormValidation>> futures = new ArrayList<Future<FormValidation>>();
+        for (UpdateSite site : getSites()) {
+            Future<FormValidation> future = site.updateDirectly(true);
+            if (future != null) {
+                futures.add(future);
+            }
+        }
+        
+        List<FormValidation> results = new ArrayList<FormValidation>(); 
+        for (Future<FormValidation> f : futures) {
+            results.add(f.get());
+        }
+        return results;
     }
 
 
@@ -883,6 +936,10 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
         }
 
         @Exported
+        public String getErrorMessage() {
+            return error != null ? error.getMessage() : null;
+        }
+        
         public Throwable getError() {
             return error;
         }
@@ -965,6 +1022,9 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
         }
 
         public void run() {
+            if (ID_UPLOAD.equals(site.getId())) {
+                return;
+            }
             LOGGER.fine("Doing a connectivity check");
             try {
                 String connectionCheckUrl = site.getConnectionCheckUrl();
@@ -1137,8 +1197,6 @@ public class UpdateCenter extends AbstractModelObject implements Saveable, OnMas
 
         /**
          * Indicates that the installation was successful but a restart is needed.
-         *
-         * @see
          */
         public class SuccessButRequiresRestart extends Success {
             private final Localizable message;

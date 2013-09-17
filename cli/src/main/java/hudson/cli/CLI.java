@@ -34,9 +34,13 @@ import hudson.remoting.SocketInputStream;
 import hudson.remoting.SocketOutputStream;
 import org.codehaus.mojo.animal_sniffer.IgnoreJRERequirement;
 
-import javax.crypto.KeyAgreement;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
@@ -61,10 +65,10 @@ import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.PublicKey;
+import java.security.SecureRandom;
 import java.security.Signature;
 import java.security.spec.DSAPrivateKeySpec;
 import java.security.spec.DSAPublicKeySpec;
-import java.security.spec.X509EncodedKeySpec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -125,31 +129,35 @@ public class CLI {
         ownsPool = exec==null;
         pool = exec!=null ? exec : Executors.newCachedThreadPool();
 
-        Channel channel = null;
-        CliPort clip = getCliTcpPort(url);
-        if(clip!=null) {
-            // connect via CLI port
+        Channel _channel;
+        try {
+            _channel = connectViaCliPort(jenkins, getCliTcpPort(url));
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE,"Failed to connect via CLI port. Falling back to HTTP",e);
             try {
-                channel = connectViaCliPort(jenkins, clip);
-            } catch (IOException e) {
-                LOGGER.log(Level.FINE,"Failed to connect via CLI port. Falling back to HTTP",e);
+                _channel = connectViaHttp(url);
+            } catch (IOException e2) {
+                try { // Java 7: e.addSuppressed(e2);
+                    Throwable.class.getMethod("addSuppressed", Throwable.class).invoke(e, e2);
+                } catch (NoSuchMethodException _ignore) {
+                    // Java 6
+                } catch (Exception _huh) {
+                    LOGGER.log(Level.SEVERE, null, _huh);
+                }
+                throw e;
             }
         }
-        if (channel==null) {
-            // connect via HTTP
-            channel = connectViaHttp(url);
-        }
-        this.channel = channel;
+        this.channel = _channel;
 
         // execute the command
-        entryPoint = (CliEntryPoint)channel.waitForRemoteProperty(CliEntryPoint.class.getName());
+        entryPoint = (CliEntryPoint)_channel.waitForRemoteProperty(CliEntryPoint.class.getName());
 
         if(entryPoint.protocolVersion()!=CliEntryPoint.VERSION)
             throw new IOException(Messages.CLI_VersionMismatch());
     }
 
     private Channel connectViaHttp(String url) throws IOException {
-        LOGGER.fine("Trying to connect to "+url+" via HTTP");
+        LOGGER.log(FINE, "Trying to connect to {0} via HTTP", url);
         url+="cli";
         URL jenkins = new URL(url);
 
@@ -168,7 +176,7 @@ public class CLI {
     }
 
     private Channel connectViaCliPort(URL jenkins, CliPort clip) throws IOException {
-        LOGGER.fine("Trying to connect directly via TCP/IP to "+clip.endpoint);
+        LOGGER.log(FINE, "Trying to connect directly via TCP/IP to {0}", clip.endpoint);
         final Socket s;
         OutputStream out;
 
@@ -180,12 +188,12 @@ public class CLI {
 
             // read the response from the proxy
             ByteArrayOutputStream rsp = new ByteArrayOutputStream();
-            while (!rsp.toString().endsWith("\r\n\r\n")) {
+            while (!rsp.toString("ISO-8859-1").endsWith("\r\n\r\n")) {
                 int ch = s.getInputStream().read();
                 if (ch<0)   throw new IOException("Failed to read the HTTP proxy response: "+rsp);
                 rsp.write(ch);
             }
-            String head = new BufferedReader(new StringReader(rsp.toString())).readLine();
+            String head = new BufferedReader(new StringReader(rsp.toString("ISO-8859-1"))).readLine();
             if (!head.startsWith("HTTP/1.0 200 "))
                 throw new IOException("Failed to establish a connection through HTTP proxy: "+rsp);
 
@@ -275,7 +283,9 @@ public class CLI {
         String identity = head.getHeaderField("X-Instance-Identity");
 
         flushURLConnection(head);
-        if (p1==null && p2==null)     return null;
+        if (p1==null && p2==null) {
+            throw new IOException("No X-Jenkins-CLI2-Port among " + head.getHeaderFields().keySet());
+        }
 
         if (p2!=null)   return new CliPort(new InetSocketAddress(h,Integer.parseInt(p2)),identity,2);
         else            return new CliPort(new InetSocketAddress(h,Integer.parseInt(p1)),identity,1);
@@ -290,14 +300,14 @@ public class CLI {
         byte[] buf = new byte[1024];
         try {
             InputStream is = conn.getInputStream();
-            while (is.read(buf) > 0) {
+            while (is.read(buf) >= 0) {
                 // Ignore
             }
             is.close();
         } catch (IOException e) {
             try {
                 InputStream es = ((HttpURLConnection)conn).getErrorStream();
-                while (es.read(buf) > 0) {
+                while (es.read(buf) >= 0) {
                     // Ignore
                 }
                 es.close();
@@ -396,6 +406,20 @@ public class CLI {
                 args = args.subList(2,args.size());
                 continue;
             }
+            if (head.equals("-noCertificateCheck")) {
+                System.out.println("Skipping HTTPS certificate checks altogether. Note that this is not secure at all.");
+                SSLContext context = SSLContext.getInstance("TLS");
+                context.init(null, new TrustManager[]{new NoCheckTrustManager()}, new SecureRandom());
+                HttpsURLConnection.setDefaultSSLSocketFactory(context.getSocketFactory());
+                // bypass host name check, too.
+                HttpsURLConnection.setDefaultHostnameVerifier(new HostnameVerifier() {
+                    public boolean verify(String s, SSLSession sslSession) {
+                        return true;
+                    }
+                });
+                args = args.subList(1,args.size());
+                continue;
+            }
             if(head.equals("-i") && args.size()>=2) {
                 File f = new File(args.get(1));
                 if (!f.exists()) {
@@ -436,7 +460,13 @@ public class CLI {
         if (candidateKeys.isEmpty())
             addDefaultPrivateKeyLocations(candidateKeys);
 
-        CLI cli = new CLIConnectionFactory().url(url).httpsProxyTunnel(httpProxy).connect();
+        CLIConnectionFactory factory = new CLIConnectionFactory().url(url).httpsProxyTunnel(httpProxy);
+        String userInfo = new URL(url).getUserInfo();
+        if (userInfo != null) {
+            factory = factory.basicAuth(userInfo);
+        }
+
+        CLI cli = factory.connect();
         try {
             if (!candidateKeys.isEmpty()) {
                 try {
@@ -458,7 +488,7 @@ public class CLI {
                         LOGGER.log(FINE,e.getMessage(),e);
                         return -1;
                     }
-                    System.err.println("Failed to authenticate with your SSH keys.");
+                    System.err.println("[WARN] Failed to authenticate with your SSH keys. Proceeding as anonymous");
                     LOGGER.log(FINE,"Failed to authenticate with your SSH keys.",e);
                 }
             }
@@ -476,8 +506,13 @@ public class CLI {
         Properties props = new Properties();
         try {
             InputStream is = CLI.class.getResourceAsStream("/jenkins/cli/jenkins-cli-version.properties");
-            if(is!=null)
-                props.load(is);
+            if(is!=null) {
+                try {
+                    props.load(is);
+                } finally {
+                    is.close();
+                }
+            }
         } catch (IOException e) {
             e.printStackTrace(); // if the version properties is missing, that's OK.
         }
@@ -496,11 +531,16 @@ public class CLI {
     }
     
     private static String readPemFile(File f) throws IOException{
-        DataInputStream dis = new DataInputStream(new FileInputStream(f));
+        FileInputStream is = new FileInputStream(f);
+        try {
+        DataInputStream dis = new DataInputStream(is);
         byte[] bytes = new byte[(int) f.length()];
         dis.readFully(bytes);
         dis.close();
         return new String(bytes);
+        } finally {
+            is.close();
+        }
     }
     
     /**

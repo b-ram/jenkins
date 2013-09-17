@@ -23,7 +23,6 @@
  */
 package hudson;
 
-import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import hudson.Plugin.DummyImpl;
 import hudson.PluginWrapper.Dependency;
@@ -36,11 +35,21 @@ import hudson.util.MaskingClassLoader;
 import hudson.util.VersionNumber;
 import jenkins.ClassLoaderReflectionToolkit;
 import jenkins.ExtensionFilter;
+import org.apache.commons.io.output.NullOutputStream;
 import org.apache.tools.ant.AntClassLoader;
 import org.apache.tools.ant.BuildException;
 import org.apache.tools.ant.Project;
 import org.apache.tools.ant.taskdefs.Expand;
+import org.apache.tools.ant.taskdefs.Zip;
 import org.apache.tools.ant.types.FileSet;
+import org.apache.tools.ant.types.PatternSet;
+import org.apache.tools.ant.types.Resource;
+import org.apache.tools.ant.types.ZipFileSet;
+import org.apache.tools.ant.types.resources.MappedResourceCollection;
+import org.apache.tools.ant.util.GlobPatternMapper;
+import org.apache.tools.zip.ZipEntry;
+import org.apache.tools.zip.ZipExtraField;
+import org.apache.tools.zip.ZipOutputStream;
 
 import java.io.Closeable;
 import java.io.File;
@@ -50,14 +59,12 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.net.URL;
-import java.net.URLClassLoader;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Vector;
 import java.util.jar.Attributes;
@@ -78,6 +85,11 @@ public class ClassicPluginStrategy implements PluginStrategy {
     };
 
     private PluginManager pluginManager;
+
+    /**
+     * All the plugins eventually delegate this classloader to load core, servlet APIs, and SE runtime.
+     */
+    private final MaskingClassLoader coreClassLoader = new MaskingClassLoader(getClass().getClassLoader());
 
     public ClassicPluginStrategy(PluginManager pluginManager) {
         this.pluginManager = pluginManager;
@@ -175,7 +187,16 @@ public class ClassicPluginStrategy implements PluginStrategy {
         for (DetachedPlugin detached : DETACHED_LIST)
             detached.fix(atts,optionalDependencies);
 
-        ClassLoader dependencyLoader = new DependencyClassLoader(getClass().getClassLoader(), archive, Util.join(dependencies,optionalDependencies));
+        // Register global classpath mask. This is useful for hiding JavaEE APIs that you might see from the container,
+        // such as database plugin for JPA support. The Mask-Classes attribute is insufficient because those classes
+        // also need to be masked by all the other plugins that depend on the database plugin.
+        String masked = atts.getValue("Global-Mask-Classes");
+        if(masked!=null) {
+            for (String pkg : masked.trim().split("[ \t\r\n]+"))
+                coreClassLoader.add(pkg);
+        }
+
+        ClassLoader dependencyLoader = new DependencyClassLoader(coreClassLoader, archive, Util.join(dependencies,optionalDependencies));
         dependencyLoader = getBaseClassLoader(atts, dependencyLoader);
 
         return new PluginWrapper(pluginManager, archive, manifest, baseResourceURL,
@@ -201,19 +222,10 @@ public class ClassicPluginStrategy implements PluginStrategy {
                 return classLoader;
             }
         }
-        if(useAntClassLoader && !Closeable.class.isAssignableFrom(URLClassLoader.class)) {
-            // using AntClassLoader with Closeable so that we can predictably release jar files opened by URLClassLoader
-            AntClassLoader2 classLoader = new AntClassLoader2(parent);
-            classLoader.addPathFiles(paths);
-            return classLoader;
-        } else {
-            // Tom reported that AntClassLoader has a performance issue when Hudson keeps trying to load a class that doesn't exist,
-            // so providing a legacy URLClassLoader support, too
-            List<URL> urls = new ArrayList<URL>();
-            for (File path : paths)
-                urls.add(path.toURI().toURL());
-            return new URLClassLoader(urls.toArray(new URL[urls.size()]),parent);
-        }
+
+        AntClassLoader2 classLoader = new AntClassLoader2(parent);
+        classLoader.addPathFiles(paths);
+        return classLoader;
     }
 
     /**
@@ -399,11 +411,10 @@ public class ClassicPluginStrategy implements PluginStrategy {
      * Explodes the plugin into a directory, if necessary.
      */
     private static void explode(File archive, File destDir) throws IOException {
-        if(!destDir.exists())
-            destDir.mkdirs();
+        destDir.mkdirs();
 
         // timestamp check
-        File explodeTime = new File(destDir,".timestamp");
+        File explodeTime = new File(destDir,".timestamp2");
         if(explodeTime.exists() && explodeTime.lastModified()==archive.lastModified())
             return; // no need to expand
 
@@ -411,12 +422,9 @@ public class ClassicPluginStrategy implements PluginStrategy {
         Util.deleteRecursive(destDir);
 
         try {
-            Expand e = new Expand();
-            e.setProject(new Project());
-            e.setTaskType("unzip");
-            e.setSrc(archive);
-            e.setDest(destDir);
-            e.execute();
+            Project prj = new Project();
+            unzipExceptClasses(archive, destDir, prj);
+            createClassJarFromWebInfClasses(archive, destDir, prj);
         } catch (BuildException x) {
             throw new IOException2("Failed to expand " + archive,x);
         }
@@ -426,6 +434,66 @@ public class ClassicPluginStrategy implements PluginStrategy {
         } catch (InterruptedException e) {
             throw new AssertionError(e); // impossible
         }
+    }
+
+    /**
+     * Repackage classes directory into a jar file to make it remoting friendly.
+     * The remoting layer can cache jar files but not class files.
+     */
+    private static void createClassJarFromWebInfClasses(File archive, File destDir, Project prj) {
+        File classesJar = new File(destDir, "WEB-INF/lib/classes.jar");
+
+        ZipFileSet zfs = new ZipFileSet();
+        zfs.setProject(prj);
+        zfs.setSrc(archive);
+        zfs.setIncludes("WEB-INF/classes/");
+
+        MappedResourceCollection mapper = new MappedResourceCollection();
+        mapper.add(zfs);
+
+        GlobPatternMapper gm = new GlobPatternMapper();
+        gm.setFrom("WEB-INF/classes/*");
+        gm.setTo("*");
+        mapper.add(gm);
+
+        final long dirTime = archive.lastModified();
+        Zip z = new Zip() {
+            /**
+             * Forces the fixed timestamp for directories to make sure
+             * classes.jar always get a consistent checksum.
+             */
+            protected void zipDir(Resource dir, ZipOutputStream zOut, String vPath,
+                                  int mode, ZipExtraField[] extra)
+                throws IOException {
+
+                ZipOutputStream wrapped = new ZipOutputStream(new NullOutputStream()) {
+                    @Override
+                    public void putNextEntry(ZipEntry ze) throws IOException {
+                        ze.setTime(dirTime+1999);   // roundup
+                        super.putNextEntry(ze);
+                    }
+                };
+                super.zipDir(dir,wrapped,vPath,mode,extra);
+            }
+        };
+        z.setProject(prj);
+        z.setTaskType("zip");
+        classesJar.getParentFile().mkdirs();
+        z.setDestFile(classesJar);
+        z.add(mapper);
+        z.execute();
+    }
+
+    private static void unzipExceptClasses(File archive, File destDir, Project prj) {
+        Expand e = new Expand();
+        e.setProject(prj);
+        e.setTaskType("unzip");
+        e.setSrc(archive);
+        e.setDest(destDir);
+        PatternSet p = new PatternSet();
+        p.setExcludes("WEB-INF/classes/");
+        e.addPatternset(p);
+        e.execute();
     }
 
     /**
@@ -458,7 +526,7 @@ public class ClassicPluginStrategy implements PluginStrategy {
                         List<PluginWrapper> dep = new ArrayList<PluginWrapper>();
                         for (Dependency d : pw.getDependencies()) {
                             PluginWrapper p = pluginManager.getPlugin(d.shortName);
-                            if (p!=null)
+                            if (p!=null && p.isActive())
                                 dep.add(p);
                         }
                         return dep;
@@ -468,7 +536,7 @@ public class ClassicPluginStrategy implements PluginStrategy {
                 try {
                     for (Dependency d : dependencies) {
                         PluginWrapper p = pluginManager.getPlugin(d.shortName);
-                        if (p!=null)
+                        if (p!=null && p.isActive())
                             cgd.run(Collections.singleton(p));
                     }
                 } catch (CycleDetectedException e) {
@@ -574,7 +642,7 @@ public class ClassicPluginStrategy implements PluginStrategy {
      * {@link AntClassLoader} with a few methods exposed and {@link Closeable} support.
      * Deprecated as of Java 7, retained only for Java 5/6.
      */
-    private static final class AntClassLoader2 extends AntClassLoader implements Closeable {
+    private final class AntClassLoader2 extends AntClassLoader implements Closeable {
         private final Vector pathComponents;
 
         private AntClassLoader2(ClassLoader parent) {
@@ -590,6 +658,7 @@ public class ClassicPluginStrategy implements PluginStrategy {
                 throw new Error(e);
             }
         }
+
 
         public void addPathFiles(Collection<File> paths) throws IOException {
             for (File f : paths)
@@ -620,6 +689,11 @@ public class ClassicPluginStrategy implements PluginStrategy {
             }
 
             return url;
+        }
+
+        @Override
+        protected Class defineClassFromData(File container, byte[] classData, String classname) throws IOException {
+            return super.defineClassFromData(container, pluginManager.getCompatibilityTransformer().transform(classname,classData), classname);
         }
     }
 

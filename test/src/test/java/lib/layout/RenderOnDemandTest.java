@@ -47,6 +47,27 @@ public class RenderOnDemandTest extends HudsonTestCase {
         assertEquals("AlphaBravoCharlie",r.getJavaScriptResult().toString());
     }
 
+    /*
+    public void testMemoryConsumption() throws Exception {
+        createWebClient().goTo("self/testBehaviour"); // prime caches
+        int total = 0;
+        for (MemoryAssert.HistogramElement element : MemoryAssert.increasedMemory(new Callable<Void>() {
+            @Override public Void call() throws Exception {
+                createWebClient().goTo("self/testBehaviour");
+                return null;
+            }
+        }, new Filter() {
+            @Override public boolean accept(Object obj, Object referredFrom, Field reference) {
+                return !obj.getClass().getName().contains("htmlunit");
+            }
+        })) {
+            total += element.byteSize;
+            System.out.println(element.className + " ×" + element.instanceCount + ": " + element.byteSize);
+        }
+        System.out.println("total: " + total);
+    }
+    */
+
     /**
      * Makes sure that scripts get evaluated.
      */
@@ -65,7 +86,9 @@ public class RenderOnDemandTest extends HudsonTestCase {
         assertEquals("yyy",r.getJavaScriptResult().toString());
 
         // if you want to test this in the browser
+        /*
         System.out.println("Try http://localhost:"+localPort+"/self/testScript");
         interactiveBreak();
+        */
     }
 }

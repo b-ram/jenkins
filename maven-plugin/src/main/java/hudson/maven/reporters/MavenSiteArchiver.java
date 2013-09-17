@@ -72,7 +72,7 @@ public class MavenSiteArchiver extends MavenReporter {
             return true;
         }
 
-        if(destDir.exists()) {
+        if(destDir != null && destDir.exists()) {
             // try to get the storage location if this is a multi-module project.
             final String moduleName = getModuleName(build, pom);
             // store at MavenModuleSet level and moduleName
@@ -154,7 +154,7 @@ public class MavenSiteArchiver extends MavenReporter {
 
         public String getIconFileName() {
             if(getSiteDir(project).exists())
-                return "help.gif";
+                return "help.png";
             else
                 // hide it since we don't have site yet.
                 return null;

@@ -26,6 +26,7 @@ package hudson.model;
 import com.google.common.base.Function;
 import com.google.common.collect.Collections2;
 import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.ExtensionPoint;
@@ -60,11 +61,14 @@ import hudson.util.TextFile;
 import hudson.widgets.HistoryWidget;
 import hudson.widgets.HistoryWidget.Adapter;
 import hudson.widgets.Widget;
+import jenkins.model.BuildDiscarder;
 import jenkins.model.Jenkins;
 import jenkins.model.ProjectNamingStrategy;
+import jenkins.security.HexStringConfidentialKey;
 import jenkins.util.io.OnMaster;
 import net.sf.json.JSONException;
 import net.sf.json.JSONObject;
+
 import org.jfree.chart.ChartFactory;
 import org.jfree.chart.JFreeChart;
 import org.jfree.chart.axis.CategoryAxis;
@@ -85,6 +89,7 @@ import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 
 import javax.servlet.ServletException;
+
 import java.awt.*;
 import java.io.*;
 import java.net.URLEncoder;
@@ -123,7 +128,14 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     private transient volatile boolean holdOffBuildUntilSave;
 
-    private volatile LogRotator logRotator;
+    /**
+     * {@link ItemListener}s can, and do, modify the job with a corresponding save which will clear
+     * {@link #holdOffBuildUntilSave} prematurely. The {@link LastItemListener} is responsible for
+     * clearing this flag as the last item listener.
+     */
+    private transient volatile boolean holdOffBuildUntilUserSave;
+
+    private volatile BuildDiscarder logRotator;
 
     /**
      * Not all plugins are good at calculating their health report quickly.
@@ -148,7 +160,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Override
     public synchronized void save() throws IOException {
         super.save();
-        holdOffBuildUntilSave = false;
+        holdOffBuildUntilSave = holdOffBuildUntilUserSave;
     }
 
     @Override
@@ -188,7 +200,6 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         } else {
             // From the old Hudson, or doCreateItem. Create this file now.
             saveNextBuildNumber();
-            save(); // and delete it from the config.xml
         }
 
         if (properties == null) // didn't exist < 1.72
@@ -203,7 +214,25 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         super.onCopiedFrom(src);
         synchronized (this) {
             this.nextBuildNumber = 1; // reset the next build number
-            this.holdOffBuildUntilSave = true;
+            this.holdOffBuildUntilUserSave = true;
+            this.holdOffBuildUntilSave = this.holdOffBuildUntilUserSave;
+        }
+    }
+
+    @Extension(ordinal = -Double.MAX_VALUE)
+    public static class LastItemListener extends ItemListener {
+
+        @Override
+        public void onCopied(Item src, Item item) {
+            // If any of the other ItemListeners modify the job, they effect
+            // a save, which will clear the holdOffBuildUntilUserSave and
+            // causing a regression of JENKINS-2494
+            if (item instanceof Job) {
+                Job job = (Job) item;
+                synchronized (job) {
+                    job.holdOffBuildUntilUserSave = false;
+                }
+            }
         }
     }
 
@@ -225,7 +254,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         return new TextFile(new File(this.getRootDir(), "nextBuildNumber"));
     }
 
-    protected boolean isHoldOffBuildUntilSave() {
+    public synchronized boolean isHoldOffBuildUntilSave() {
         return holdOffBuildUntilSave;
     }
 
@@ -308,8 +337,8 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     public EnvVars getCharacteristicEnvVars() {
         EnvVars env = new EnvVars();
-        env.put("JENKINS_SERVER_COOKIE",Util.getDigestOf("ServerID:"+ Jenkins.getInstance().getSecretKey()));
-        env.put("HUDSON_SERVER_COOKIE",Util.getDigestOf("ServerID:"+ Jenkins.getInstance().getSecretKey())); // Legacy compatibility
+        env.put("JENKINS_SERVER_COOKIE",SERVER_COOKIE.get());
+        env.put("HUDSON_SERVER_COOKIE",SERVER_COOKIE.get()); // Legacy compatibility
         env.put("JOB_NAME",getFullName());
         return env;
     }
@@ -340,6 +369,11 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         // see http://www.nabble.com/Run-Job-with-JDK-1.4.2-tf4468601.html
         env.put("CLASSPATH","");
 
+        // apply them in a reverse order so that higher ordinal ones can modify values added by lower ordinal ones
+        for (EnvironmentContributor ec : EnvironmentContributor.all().reverseView())
+            ec.buildEnvironmentFor(this,env,listener);
+
+
         return env;
     }
 
@@ -362,23 +396,45 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     }
 
     /**
-     * Returns the log rotator for this job, or null if none.
+     * Returns the configured build discarder for this job, or null if none.
      */
-    public LogRotator getLogRotator() {
+    public BuildDiscarder getBuildDiscarder() {
         return logRotator;
     }
 
-    public void setLogRotator(LogRotator logRotator) {
-        this.logRotator = logRotator;
+    public void setBuildDiscarder(BuildDiscarder bd) throws IOException {
+        this.logRotator = bd;
+        save();
+    }
+
+    /**
+     * Left for backward compatibility. Returns non-null if and only
+     * if {@link LogRotator} is configured as {@link BuildDiscarder}.
+     *
+     * @deprecated as of 1.503
+     *      Use {@link #getBuildDiscarder()}.
+     */
+    public LogRotator getLogRotator() {
+        if (logRotator instanceof LogRotator)
+            return (LogRotator) logRotator;
+        return null;
+    }
+
+    /**
+     * @deprecated as of 1.503
+     *      Use {@link #setBuildDiscarder(BuildDiscarder)}
+     */
+    public void setLogRotator(LogRotator logRotator) throws IOException {
+        setBuildDiscarder(logRotator);
     }
 
     /**
      * Perform log rotation.
      */
     public void logRotate() throws IOException, InterruptedException {
-        LogRotator lr = getLogRotator();
-        if (lr != null)
-            lr.perform(this);
+        BuildDiscarder bd = getBuildDiscarder();
+        if (bd != null)
+            bd.perform(this);
     }
 
     /**
@@ -548,7 +604,19 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     @Override
     public void renameTo(String newName) throws IOException {
+        File oldBuildDir = getBuildDir();
         super.renameTo(newName);
+        File newBuildDir = getBuildDir();
+        if (oldBuildDir.isDirectory() && !newBuildDir.isDirectory()) {
+            if (!oldBuildDir.renameTo(newBuildDir)) {
+                throw new IOException("failed to rename " + oldBuildDir + " to " + newBuildDir);
+            }
+        }
+    }
+
+    @Override public synchronized void delete() throws IOException, InterruptedException {
+        super.delete();
+        Util.deleteRecursive(getBuildDir());
     }
 
     /**
@@ -575,7 +643,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     @Exported(name="builds")
     public RunList<RunT> getNewBuilds() {
-        return getBuilds().newBuilds();
+        return getBuilds().limit(100);
     }
 
     /**
@@ -707,7 +775,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      * 
      * @see RunMap
      */
-    protected File getBuildDir() {
+    public File getBuildDir() {
         return Jenkins.getInstance().getBuildDirFor(this);
     }
 
@@ -762,13 +830,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastSuccessfulBuild() {
-        RunT r = getLastBuild();
-        // temporary hack till we figure out what's causing this bug
-        while (r != null
-                && (r.isBuilding() || r.getResult() == null || r.getResult()
-                        .isWorseThan(Result.UNSTABLE)))
-            r = r.getPreviousBuild();
-        return r;
+        return (RunT)Permalink.LAST_SUCCESSFUL_BUILD.resolve(this);
     }
 
     /**
@@ -778,11 +840,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastUnsuccessfulBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult() == Result.SUCCESS))
-            r = r.getPreviousBuild();
-        return r;
+        return (RunT)Permalink.LAST_UNSUCCESSFUL_BUILD.resolve(this);
     }
 
     /**
@@ -792,11 +850,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastUnstableBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult() != Result.UNSTABLE))
-            r = r.getPreviousBuild();
-        return r;
+        return (RunT)Permalink.LAST_UNSTABLE_BUILD.resolve(this);
     }
 
     /**
@@ -806,11 +860,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastStableBuild() {
-        RunT r = getLastBuild();
-        while (r != null
-                && (r.isBuilding() || r.getResult().isWorseThan(Result.SUCCESS)))
-            r = r.getPreviousBuild();
-        return r;
+        return (RunT)Permalink.LAST_STABLE_BUILD.resolve(this);
     }
 
     /**
@@ -819,10 +869,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported
     @QuickSilver
     public RunT getLastFailedBuild() {
-        RunT r = getLastBuild();
-        while (r != null && (r.isBuilding() || r.getResult() != Result.FAILURE))
-            r = r.getPreviousBuild();
-        return r;
+        return (RunT)Permalink.LAST_FAILED_BUILD.resolve(this);
     }
 
     /**
@@ -859,8 +906,52 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         return result;
     }
     
+    /**
+     * Returns candidate build for calculating the estimated duration of the current run.
+     * 
+     * Returns the 3 last successful (stable or unstable) builds, if there are any.
+     * Failing to find 3 of those, it will return up to 3 last unsuccessful builds.
+     * 
+     * In any case it will not go more than 6 builds into the past to avoid costly build loading.
+     */
+    @SuppressWarnings("unchecked")
+    protected List<RunT> getEstimatedDurationCandidates() {
+        List<RunT> candidates = new ArrayList<RunT>(3);
+        RunT lastSuccessful = (RunT) Permalink.LAST_SUCCESSFUL_BUILD.resolve(this);
+        int lastSuccessfulNumber = -1;
+        if (lastSuccessful != null) {
+            candidates.add(lastSuccessful);
+            lastSuccessfulNumber = lastSuccessful.getNumber();
+        }
+
+        int i = 0;
+        RunT r = (RunT) Permalink.LAST_BUILD.resolve(this);
+        List<RunT> fallbackCandidates = new ArrayList<RunT>(3);
+        while (r != null && candidates.size() < 3 && i < 6) {
+            if (!r.isBuilding() && r.getResult() != null && r.getNumber() != lastSuccessfulNumber) {
+                Result result = r.getResult();
+                if (result.isBetterOrEqualTo(Result.UNSTABLE)) {
+                    candidates.add(r);
+                } else if (result.isCompleteBuild()) {
+                    fallbackCandidates.add(r);
+                }
+            }
+            i++;
+            r = r.getPreviousBuild();
+        }
+        
+        while (candidates.size() < 3) {
+            if (fallbackCandidates.isEmpty())
+                break;
+            RunT run = fallbackCandidates.remove(0);
+            candidates.add(run);
+        }
+        
+        return candidates;
+    }
+    
     public long getEstimatedDuration() {
-        List<RunT> builds = getLastBuildsOverThreshold(3, Result.UNSTABLE);
+        List<RunT> builds = getEstimatedDurationCandidates();
         
         if(builds.isEmpty())     return -1;
 
@@ -902,7 +993,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         if (lastBuild != null)
             return lastBuild.getIconColor();
         else
-            return BallColor.GREY;
+            return BallColor.NOTBUILT;
     }
 
     /**
@@ -1029,8 +1120,8 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
 
             setDisplayName(json.optString("displayNameOrNull"));
 
-            if (req.getParameter("logrotate") != null)
-                logRotator = LogRotator.DESCRIPTOR.newInstance(req,json.getJSONObject("logrotate"));
+            if (json.optBoolean("logrotate"))
+                logRotator = req.bindJSON(BuildDiscarder.class, json.optJSONObject("buildDiscarder"));
             else
                 logRotator = null;
 
@@ -1313,4 +1404,6 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     public BuildTimelineWidget getTimeline() {
         return new BuildTimelineWidget(getBuilds());
     }
+
+    private final static HexStringConfidentialKey SERVER_COOKIE = new HexStringConfidentialKey(Job.class,"serverCookie",16);
 }

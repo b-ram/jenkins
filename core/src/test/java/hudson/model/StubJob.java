@@ -28,8 +28,9 @@ import java.util.SortedMap;
 
 /**
  * @author kingfai
- *
+ * @deprecated Does not behave very consistently. Either write a real functional test with {@code JenkinsRule}, or use PowerMock/Mockito.
  */
+@Deprecated
 @SuppressWarnings({ "rawtypes", "unchecked" })
 class StubJob extends Job {
 
@@ -57,7 +58,7 @@ class StubJob extends Job {
         
     }
 
-    @Override protected File getBuildDir() {
+    @Override public File getBuildDir() {
         return new File(System.getProperty("java.io.tmpdir"));
     }
     
@@ -68,5 +69,9 @@ class StubJob extends Job {
     public void save() {
         
     }   
+
+    @Override public ItemGroup getParent() {
+        return null;
+    }
 
 }

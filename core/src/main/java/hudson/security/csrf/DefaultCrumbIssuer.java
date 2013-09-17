@@ -100,7 +100,7 @@ public class DefaultCrumbIssuer extends CrumbIssuer {
         return false;
     }
 
-    private final String PROXY_HEADER = "X-Forwarded-For";
+    private static final String PROXY_HEADER = "X-Forwarded-For";
 
     private String getClientIP(HttpServletRequest req) {
         String defaultAddress = req.getRemoteAddr();
@@ -118,7 +118,8 @@ public class DefaultCrumbIssuer extends CrumbIssuer {
     public static final class DescriptorImpl extends CrumbIssuerDescriptor<DefaultCrumbIssuer> implements ModelObject {
 
         public DescriptorImpl() {
-            super(Jenkins.getInstance().getSecretKey(), System.getProperty("hudson.security.csrf.requestfield", ".crumb"));
+            // salt just needs to be unique, and it doesn't have to be a secret
+            super(Jenkins.getInstance().getLegacyInstanceId(), System.getProperty("hudson.security.csrf.requestfield", ".crumb"));
             load();
         }
 
